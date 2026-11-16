@@ -21,10 +21,34 @@ BIRD_CLASS_ID = 14
 
 
 def load_yolo_model(model_name: str = "yolov8n.pt"):
-    """Carga (o descarga) el modelo YOLO. Se cachea a nivel de proceso."""
+    """
+    Carga el modelo YOLO. Busca primero en la carpeta local models/;
+    si no está, lo descarga vía Ultralytics y lo copia a models/.
+    """
     if not _HAS_ULTRALYTICS:
         raise RuntimeError("La librería 'ultralytics' no está instalada. Ejecuta: pip install ultralytics")
-    return YOLO(model_name)
+
+    # Ruta local en models/
+    models_dir = os.path.join(os.path.dirname(__file__), "..", "models")
+    os.makedirs(models_dir, exist_ok=True)
+    local_path = os.path.join(models_dir, model_name)
+
+    if os.path.exists(local_path):
+        return YOLO(local_path)
+
+    # Descargar vía ultralytics (guarda en ~/.ultralytics/ por defecto)
+    model = YOLO(model_name)
+
+    # Intentar copiar a models/ para futuras ejecuciones
+    try:
+        import shutil
+        src = os.path.expanduser(f"~/.ultralytics/{model_name}")
+        if os.path.exists(src):
+            shutil.copy2(src, local_path)
+    except Exception:
+        pass
+
+    return model
 
 
 def detect_birds(image_path: str, model, conf_threshold: float = 0.25) -> List[dict]:

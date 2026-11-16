@@ -47,8 +47,8 @@ from modules.utils import build_footprint_map, draw_boundary_on_image
 # Cachés
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner="Cargando modelo YOLOv8...")
-def cached_yolo():
-    return load_yolo_model("yolov8n.pt")
+def cached_yolo(model_name: str = "yolov8n.pt"):
+    return load_yolo_model(model_name)
 
 
 @st.cache_data(show_spinner="Leyendo metadatos EXIF/XMP...")
@@ -74,9 +74,17 @@ def cached_pairs(photos_tuple: tuple, min_overlap: float) -> list:
 st.sidebar.title("⚙️ Configuración")
 
 uploaded_files = st.sidebar.file_uploader(
-    "📤 Sube tus fotos de dron (JPEG)",
-    type=["jpg", "jpeg", "JPG", "JPEG"],
+    "📤 Sube tus fotos de dron (JPEG / TIFF)",
+    type=["jpg", "jpeg", "JPG", "JPEG", "tif", "tiff", "TIF", "TIFF"],
     accept_multiple_files=True,
+)
+
+model_name = st.sidebar.text_input(
+    "Modelo YOLO para frontera",
+    value="yolov8n.pt",
+    help="Nombre del archivo .pt dentro de la carpeta models/. "
+         "Puedes cambiarlo por yolov8s.pt, yolov8m.pt, etc. "
+         "Si no existe, se descargará automáticamente.",
 )
 
 use_detector = st.sidebar.checkbox(
@@ -139,36 +147,80 @@ if not uploaded_files:
     )
     st.stop()
 
-# Guardar archivos subidos a disco temporal
-with tempfile.TemporaryDirectory() as tmpdir:
-    file_paths = []
-    for uf in uploaded_files:
-        path = os.path.join(tmpdir, uf.name)
-        with open(path, "wb") as f:
-            f.write(uf.getvalue())
-        file_paths.append(path)
+# Guardar archivos subidos a directorio persistente (evita que se borren entre reruns)
+UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "union_fotos_aves_uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-    # --- Paso 1: Metadatos y footprints ---
-    with st.spinner("Leyendo metadatos EXIF/XMP..."):
-        metadata_list = cached_metadata(tuple(file_paths))
+file_paths = []
+for uf in uploaded_files:
+    path = os.path.join(UPLOAD_DIR, uf.name)
+    with open(path, "wb") as f:
+        f.write(uf.getvalue())
+    file_paths.append(path)
 
-    # Filtrar fotos sin GPS
-    valid_photos = [m for m in metadata_list if m.get('latitude') and m.get('longitude')]
-    if not valid_photos:
-        st.error("Ninguna de las fotos subidas contiene coordenadas GPS válidas. "
-                 "Asegúrate de que sean fotos de dron con metadatos intactos.")
-        st.stop()
+# --- Paso 1: Metadatos y footprints ---
+with st.spinner("Leyendo metadatos EXIF/XMP..."):
+    metadata_list = cached_metadata(tuple(file_paths))
 
-    with st.spinner("Calculando footprints..."):
-        photos = cached_footprints(tuple(valid_photos))
+# Filtrar fotos sin GPS
+valid_photos = [m for m in metadata_list if m.get('latitude') and m.get('longitude')]
+if not valid_photos:
+    st.error("Ninguna de las fotos subidas contiene coordenadas GPS válidas. "
+             "Asegúrate de que sean fotos de dron con metadatos intactos.")
+    st.stop()
 
-    with st.spinner("Buscando pares superpuestos..."):
-        pairs = cached_pairs(tuple(photos), min_overlap_area)
+with st.spinner("Calculando footprints..."):
+    photos = cached_footprints(tuple(valid_photos))
 
-    st.title("🐦 Unión de Fotos de Aves Marinas")
-    st.success(f"Se encontraron {len(pairs)} par(es) superpuesto(s) de {len(photos)} foto(s).")
+with st.spinner("Buscando pares superpuestos..."):
+    pairs = cached_pairs(tuple(photos), min_overlap_area)
 
-    # --- Pestañas principales ---
+st.title("🐦 Unión de Fotos de Aves Marinas")
+st.success(f"Se encontraron {len(pairs)} par(es) superpuesto(s) de {len(photos)} foto(s).")
+
+
+# ---------------------------------------------------------------------------
+# Función helper: ajustar línea de frontera (debe estar definida a nivel de módulo
+# para poder usarse tanto en la pestaña de edición como en la de descarga)
+# ---------------------------------------------------------------------------
+def adjust_line(line_px, img_w, img_h, offset_px, angle_deg):
+    if not line_px or len(line_px) < 2:
+        return line_px
+    x1, y1 = line_px[0]
+    x2, y2 = line_px[-1]
+    # Centro de la línea
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    # Vector dirección
+    dx = x2 - x1
+    dy = y2 - y1
+    L = math.hypot(dx, dy) + 1e-9
+    ux, uy = dx / L, dy / L
+    # Perpendicular
+    px, py = -uy, ux
+    # Aplicar offset perpendicular
+    cx += px * offset_px
+    cy += py * offset_px
+    # Aplicar rotación
+    theta = math.radians(angle_deg)
+    rx = ux * math.cos(theta) - uy * math.sin(theta)
+    ry = ux * math.sin(theta) + uy * math.cos(theta)
+    # Extender hasta los bordes de la imagen
+    ts = []
+    if abs(rx) > 1e-6:
+        ts.append((0 - cx) / rx)
+        ts.append((img_w - cx) / rx)
+    if abs(ry) > 1e-6:
+        ts.append((0 - cy) / ry)
+        ts.append((img_h - cy) / ry)
+    ts = [t for t in ts if not math.isinf(t)]
+    if len(ts) >= 2:
+        t1, t2 = min(ts), max(ts)
+        return [(cx + t1 * rx, cy + t1 * ry), (cx + t2 * rx, cy + t2 * ry)]
+    return line_px
+
+
+# --- Pestañas principales ---
     tab_map, tab_pairs, tab_preview, tab_download = st.tabs(
         ["🗺️ Mapa", "🔗 Pares", "✏️ Edición y Vista Previa", "⬇️ Descargar"]
     )
@@ -215,7 +267,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
             )
 
             # Cargar modelo YOLO si se necesita
-            model = cached_yolo() if use_detector else None
+            model = cached_yolo(model_name) if use_detector else None
 
             pair_idx = st.selectbox("Selecciona un par para editar", range(len(pairs)),
                                     format_func=lambda i: f"Par {i+1}: {os.path.basename(pairs[i]['photo_a']['path'])} ↔ {os.path.basename(pairs[i]['photo_b']['path'])}")
@@ -259,45 +311,6 @@ with tempfile.TemporaryDirectory() as tmpdir:
                     key=f"angle_{pair_idx}"
                 )
             st.session_state.pair_adjustments[adj_key] = {"offset": offset, "angle": angle}
-
-            # Aplicar ajuste a la línea en píxeles
-            def adjust_line(line_px, img_w, img_h, offset_px, angle_deg):
-                if not line_px or len(line_px) < 2:
-                    return line_px
-                x1, y1 = line_px[0]
-                x2, y2 = line_px[-1]
-                # Centro de la línea
-                cx = (x1 + x2) / 2.0
-                cy = (y1 + y2) / 2.0
-                # Vector dirección
-                dx = x2 - x1
-                dy = y2 - y1
-                L = math.hypot(dx, dy) + 1e-9
-                ux, uy = dx / L, dy / L
-                # Perpendicular
-                px, py = -uy, ux
-                # Aplicar offset perpendicular
-                cx += px * offset_px
-                cy += py * offset_px
-                # Aplicar rotación
-                theta = math.radians(angle_deg)
-                rx = ux * math.cos(theta) - uy * math.sin(theta)
-                ry = ux * math.sin(theta) + uy * math.cos(theta)
-                # Extender hasta los bordes de la imagen
-                # Usamos parametrización: (cx, cy) + t * (rx, ry)
-                # Encontrar t tal que x o y estén en [0, w] o [0, h]
-                ts = []
-                if abs(rx) > 1e-6:
-                    ts.append((0 - cx) / rx)
-                    ts.append((img_w - cx) / rx)
-                if abs(ry) > 1e-6:
-                    ts.append((0 - cy) / ry)
-                    ts.append((img_h - cy) / ry)
-                ts = [t for t in ts if not math.isinf(t)]
-                if len(ts) >= 2:
-                    t1, t2 = min(ts), max(ts)
-                    return [(cx + t1 * rx, cy + t1 * ry), (cx + t2 * rx, cy + t2 * ry)]
-                return line_px
 
             img_w_a, img_h_a = photo_a['image_width'], photo_a['image_height']
             img_w_b, img_h_b = photo_b['image_width'], photo_b['image_height']
@@ -357,7 +370,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
 
         if st.button("🚀 Procesar todas las fotos", type="primary"):
             with st.spinner("Procesando... esto puede tomar unos minutos."):
-                model = cached_yolo() if use_detector else None
+                model = cached_yolo(model_name) if use_detector else None
 
                 # Inicializar máscaras acumuladas por foto
                 masks = {}

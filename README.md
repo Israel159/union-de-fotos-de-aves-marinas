@@ -61,9 +61,16 @@ streamlit run app.py
 
 ## Fotos compatibles
 
-- JPEG con metadatos EXIF estándar (GPS, focal length).
+- JPEG y TIFF con metadatos EXIF estándar (GPS, focal length).
 - XMP de DJI (Phantom, Mavic, etc.) para orientación del gimbal y altitud relativa.
 - Probado con DJI Phantom 3 Professional.
+
+## Modelo YOLO configurable
+
+Para usar un modelo diferente (por ejemplo `yolov8l.pt`):
+1. Coloca el archivo `.pt` dentro de la carpeta `models/`.
+2. En el panel de configuración (sidebar), cambia el nombre del modelo.
+3. Si el archivo no existe localmente, se descargará automáticamente la primera vez.
 
 ## Licencia
 

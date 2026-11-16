@@ -9,12 +9,34 @@ from PIL.ExifTags import TAGS, GPSTAGS
 import xml.etree.ElementTree as ET
 
 
+def _to_float(value):
+    """Convierte un valor EXIF (int, float, str, IFDRational, tuple) a float."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        return float(value)
+    # PIL IFDRational
+    if hasattr(value, 'numerator') and hasattr(value, 'denominator'):
+        return float(value.numerator) / float(value.denominator)
+    # Si tiene __float__
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        pass
+    # Tupla/lista tipo ratio
+    if isinstance(value, (tuple, list)) and len(value) >= 2:
+        return float(value[0]) / float(value[1])
+    raise ValueError(f"No se puede convertir a float: {value} (tipo {type(value)})")
+
+
 def _dms_to_dd(dms, ref):
     """Convierte grados/minutos/segundos a decimal."""
     if dms is None:
         return None
     d, m, s = dms
-    dd = float(d) + float(m) / 60 + float(s) / 3600
+    dd = _to_float(d) + _to_float(m) / 60 + _to_float(s) / 3600
     if ref in ('S', 'W'):
         dd = -dd
     return dd
@@ -133,7 +155,7 @@ def read_metadata(image_path: str) -> dict:
                 meta['latitude'] = _dms_to_dd(lat_dms, lat_ref)
                 meta['longitude'] = _dms_to_dd(lon_dms, lon_ref)
                 if alt is not None:
-                    alt_val = float(alt) if isinstance(alt, (int, float, str)) else float(alt[0]) / float(alt[1])
+                    alt_val = _to_float(alt)
                     if alt_ref == 1:  # bajo el nivel del mar
                         alt_val = -alt_val
                     meta['altitude_abs'] = alt_val
@@ -164,10 +186,10 @@ def read_metadata(image_path: str) -> dict:
     if meta['altitude'] is None and meta['altitude_abs'] is not None:
         meta['altitude'] = meta['altitude_abs']
 
-    # Normalizar focal_length (puede venir como objeto Rational de PIL)
-    if hasattr(meta['focal_length'], 'numerator') and hasattr(meta['focal_length'], 'denominator'):
-        meta['focal_length'] = float(meta['focal_length'].numerator) / float(meta['focal_length'].denominator)
-    elif meta['focal_length'] is not None:
-        meta['focal_length'] = float(meta['focal_length'])
+    # Normalizar focal_length y focal_length_35mm (pueden venir como IFDRational)
+    if meta['focal_length'] is not None:
+        meta['focal_length'] = _to_float(meta['focal_length'])
+    if meta['focal_length_35mm'] is not None:
+        meta['focal_length_35mm'] = _to_float(meta['focal_length_35mm'])
 
     return meta
