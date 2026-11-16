@@ -1,266 +1,439 @@
-"""App de conteo de aves con deduplicación georreferenciada.
+"""
+Union de Fotos de Aves Marinas — Streamlit App
+================================================
+Aplicación para eliminar superposiciones entre fotos de dron tomando
+en cuenta la georreferencia EXIF/XMP y detecciones genéricas de aves (YOLOv8).
 
 Flujo:
-  1. SUBIR fotos (lee EXIF GPS + XMP de DJI; soporta JPG y TIFF)
-  2. DETECTAR aves en cada foto (YOLO)
-  3. EMPAREJAR detecciones candidatas a duplicado (misma clase + cercanía GPS)
-  4. VALIDAR cada pareja visualmente (misma ave / diferentes)
-  5. RESULTADO: individuos únicos, conteo por clase y mapa
-
-Cambios respecto a la versión anterior:
-- Acepta .tif/.tiff (y .png, para dar un mensaje claro si el compresor web
-  eliminó los metadatos).
-- Fotos con GPS pero sin altitud ya NO se omiten: se les aplica la
-  "Altitud por defecto (m)" de la barra lateral y se avisa en pantalla.
+1. Subir lote de fotos (JPEG con EXIF/XMP de DJI).
+2. Leer metadatos, calcular footprints, detectar pares superpuestos.
+3. Para cada par: proponer frontera (geométrica o híbrida con detecciones).
+4. Permitir edición manual de la frontera (offset + rotación).
+5. Aplicar máscaras y descargar el lote procesado.
 """
+import os
 import io
 import math
-import pandas as pd
+import tempfile
+import numpy as np
+from PIL import Image, ImageDraw
 import streamlit as st
-from PIL import Image
 
-from modules.exif_utils import extract_metadata
-from modules.geo import (bbox_center_and_ground_size, footprint_size_m,
-                         footprint_from_fov, offset_to_latlon,
-                         pixel_to_ground_offset)
-from modules.detector import get_detector
-from modules.matching import build_candidates, cluster_detections
+# ---------------------------------------------------------------------------
+# Configuración de página
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Unión de Fotos de Aves Marinas",
+    page_icon="🐦",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-st.set_page_config(page_title="Conteo de aves — deduplicación", layout="wide")
+# ---------------------------------------------------------------------------
+# Importación de módulos propios
+# ---------------------------------------------------------------------------
+from modules.exif_reader import read_metadata
+from modules.footprint import batch_footprints
+from modules.overlap import find_overlapping_pairs
+from modules.detector import load_yolo_model, detect_birds, match_duplicates
+from modules.boundary import compute_boundary, _utm_to_pixel
+from modules.processor import (
+    fit_split_line, create_mask, apply_white_mask,
+    build_download_zip,
+)
+from modules.utils import build_footprint_map, draw_boundary_on_image
 
-CLASES = ["pinguino", "piquero", "pelicano", "zarcillo"]
+# ---------------------------------------------------------------------------
+# Cachés
+# ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner="Cargando modelo YOLOv8...")
+def cached_yolo():
+    return load_yolo_model("yolov8n.pt")
 
-# ----------------------------- estado global -------------------------------
-ss = st.session_state
-ss.setdefault("photos", {})       # nombre -> {pil, meta, g_w, g_h}
-ss.setdefault("detections", [])   # lista plana de detecciones georreferenciadas
-ss.setdefault("candidates", [])
-ss.setdefault("decisions", {})    # id_candidato -> True/False
-ss.setdefault("val_idx", 0)
 
-# ----------------------------- utilidades ----------------------------------
-def crop_with_margin(pil_img, bbox, margin=0.4):
-    x1, y1, x2, y2 = [int(v) for v in bbox]
-    w, h = x2 - x1, y2 - y1
-    mx, my = int(w * margin), int(h * margin)
-    return pil_img.crop((max(0, x1 - mx), max(0, y1 - my),
-                         min(pil_img.width, x2 + mx), min(pil_img.height, y2 + my)))
+@st.cache_data(show_spinner="Leyendo metadatos EXIF/XMP...")
+def cached_metadata(file_paths: tuple) -> list:
+    """Lee metadatos de una lista de rutas de archivos."""
+    return [read_metadata(fp) for fp in file_paths]
 
-def pending_candidates():
-    return [c for c in ss.candidates if c["id"] not in ss.decisions]
 
-# ----------------------------- barra lateral -------------------------------
-st.sidebar.title("Pipeline")
-step = st.sidebar.radio("Paso", ["1. Subir fotos", "2. Detectar", "3. Emparejar",
-                                 "4. Validar uniones", "5. Resultado"])
+@st.cache_data(show_spinner="Calculando footprints georreferenciados...")
+def cached_footprints(metadata_tuple: tuple) -> list:
+    """Calcula footprints a partir de metadatos."""
+    return batch_footprints(list(metadata_tuple))
 
-with st.sidebar.expander("Ajustes del detector y GPS"):
-    conf_min = st.slider("Confianza mínima del detector (YOLO)", 0.05, 0.95, 0.40,
-                         help="Solo se aceptan detecciones con confianza >= este valor. "
-                              "Si te salen muchas falsas positivas, súbelo; si se te "
-                              "escapan aves, bájalo.")
-    umbral_m = st.number_input("Distancia máx. entre candidatos (m) — 0 = automático",
-                               min_value=0.0, value=0.0, step=0.5,
-                               help="Dos detecciones de la misma clase a menos de esta "
-                                    "distancia en el suelo se proponen para unir. "
-                                    "Empieza con 0 (automático) y ajústalo tras ver resultados.")
-    dist_factor = st.slider("Factor de umbral automático", 0.5, 3.0, 1.2)
-    alt_default = st.number_input(
-        "Altitud por defecto (m)", min_value=1.0, value=50.0, step=5.0,
-        help="Se aplica a las fotos que tienen GPS pero perdieron la altitud "
-             "(p. ej. las pasadas por un compresor web que borra el XMP). "
-             "Idealmente súbelo a la altitud de vuelo de tu dron (la relativa "
-             "sobre el terreno).")
 
-    st.caption("Huella en el suelo (elige el modo):")
-    modo_huella = st.radio("Modo de huella",
-                           ["EXIF automático",
-                            "FOV calibrado (recomendado P3P)"],
-                           help="EXIF automático: deriva el sensor de FocalLength y "
-                                "FocalLengthIn35mmFilm. FOV calibrado: usa el campo "
-                                "visual de la cámara (más fiable si el EXIF de DJI "
-                                "es nominal). Phantom 3 Pro oficial: 84° x 62°.")
-    if modo_huella.startswith("FOV"):
-        fov_h = st.number_input("FOV horizontal (°)", 10.0, 170.0, 84.0, format="%.1f")
-        fov_v = st.number_input("FOV vertical (°)", 10.0, 170.0, 62.0, format="%.1f")
-    else:
-        fov_h = fov_v = None
-        st.caption("Cámara (fallback si el EXIF no trae sensor):")
-        def_sensor_w = st.number_input("Ancho sensor (mm)", 1.0, 50.0, 18.4, format="%.1f")
-        def_sensor_h = st.number_input("Alto sensor (mm)", 1.0, 50.0, 12.3, format="%.1f")
-        def_focal = st.number_input("Focal fallback (mm)", 1.0, 50.0, 12.29, format="%.2f")
+@st.cache_data(show_spinner="Detectando pares superpuestos...")
+def cached_pairs(photos_tuple: tuple, min_overlap: float) -> list:
+    return find_overlapping_pairs(list(photos_tuple), min_overlap_m2=min_overlap)
 
-# ----------------------------- paso 1: subir -------------------------------
-if step == "1. Subir fotos":
-    st.header("1. Subir lote de fotos")
-    files = st.file_uploader("Fotos del dron (JPG/TIFF con EXIF/GPS)",
-                             type=["jpg", "jpeg", "tif", "tiff", "png"],
-                             accept_multiple_files=True)
-    if files:
-        for f in files:
-            if f.name in ss.photos:
-                continue
-            raw = f.read()
-            path = f"/tmp/{f.name}"
-            with open(path, "wb") as out:
-                out.write(raw)
-            try:
-                meta = extract_metadata(path)
-            except ValueError as e:
-                st.warning(f"{f.name}: {e}")
-                continue
-            pil = Image.open(io.BytesIO(raw))
-            if meta["alt_m"] is None:
-                meta["alt_m"] = float(alt_default)
-                meta["alt_default"] = True
-                st.info(f"{f.name}: sin altitud en los metadatos — se usa la "
-                        f"altitud por defecto ({alt_default:.0f} m). "
-                        "Si el dron volaba a otra altura, cámbiala en la barra lateral.")
-            else:
-                meta["alt_default"] = False
-            if modo_huella.startswith("FOV"):
-                g_w = footprint_from_fov(meta["alt_m"], fov_h)
-                g_h = footprint_from_fov(meta["alt_m"], fov_v)
-                st.caption(f"{f.name}: huella por FOV {fov_h}°x{fov_v}° "
-                           f"= {g_w:.1f} x {g_h:.1f} m a {meta['alt_m']:.1f} m de altitud.")
-            else:
-                sensor_w = meta.get("sensor_w_mm") or def_sensor_w
-                sensor_h = meta.get("sensor_h_mm") or def_sensor_h
-                focal = meta.get("focal_mm") or def_focal
-                if meta.get("sensor_w_mm") is None:
-                    st.info(f"{f.name}: sensor no legible en EXIF, usando valores "
-                            f"manuales ({def_sensor_w}×{def_sensor_h} mm, f={def_focal} mm).")
-                g_w = footprint_size_m(meta["alt_m"], focal, sensor_w)
-                g_h = footprint_size_m(meta["alt_m"], focal, sensor_h)
-            ss.photos[f.name] = {"pil": pil, "meta": meta, "g_w": g_w, "g_h": g_h}
-        st.success(f"{len(ss.photos)} fotos cargadas con GPS.")
-        st.dataframe(pd.DataFrame([{**v["meta"], "foto": k}
-                                   for k, v in ss.photos.items()]))
-        n_def = sum(1 for v in ss.photos.values() if v["meta"].get("alt_default"))
-        if n_def:
-            st.warning(f"{n_def} foto(s) usan la altitud por defecto. El tamaño de "
-                       "la huella (y por tanto las coordenadas de cada ave) será "
-                       "aproximado: corrige la altitud real de vuelo y vuelve a "
-                       "subir el lote para mayor precisión.")
-        st.caption("Verifica que alt_m sea razonable (la relativa del XMP es la "
-                   "mejor) y que yaw_deg exista. Si el EXIF de DJI es nominal, "
-                   "prueba el modo de huella por FOV en la barra lateral.")
 
-# ----------------------------- paso 2: detectar ----------------------------
-elif step == "2. Detectar":
-    st.header("2. Ejecutar detector por foto")
-    if not ss.photos:
-        st.info("Primero sube fotos en el paso 1.")
-    elif st.button("Detectar aves", type="primary"):
-        try:
-            detector = get_detector()
-        except FileNotFoundError as e:
-            st.error(str(e))
-            st.stop()
-        ss.detections = []
-        bar = st.progress(0.0)
-        for n, (name, p) in enumerate(ss.photos.items()):
-            for det in detector.predict(p["pil"]):
-                if det["conf"] < conf_min:
-                    continue
-                cx, cy, size_m = bbox_center_and_ground_size(
-                    det, p["meta"]["img_w"], p["meta"]["img_h"], p["g_w"], p["g_h"])
-                dx, dy = pixel_to_ground_offset(
-                    cx, cy, p["meta"]["img_w"], p["meta"]["img_h"],
-                    p["g_w"], p["g_h"], p["meta"]["yaw_deg"] or 0.0)
-                lat, lon = offset_to_latlon(p["meta"]["lat"], p["meta"]["lon"], dx, dy)
-                ss.detections.append({**det, "img": name, "lat": lat, "lon": lon,
-                                      "size_m": size_m})
-            bar.progress((n + 1) / len(ss.photos))
-        st.success(f"{len(ss.detections)} detecciones en {len(ss.photos)} fotos.")
-    if ss.detections:
-        st.dataframe(pd.DataFrame(ss.detections))
+# ---------------------------------------------------------------------------
+# Sidebar — Configuración y carga
+# ---------------------------------------------------------------------------
+st.sidebar.title("⚙️ Configuración")
 
-# ----------------------------- paso 3: emparejar ---------------------------
-elif step == "3. Emparejar":
-    st.header("3. Buscar candidatas a duplicado")
-    if not ss.detections:
-        st.info("Primero ejecuta el detector (paso 2).")
-    else:
-        ss.candidates = build_candidates(ss.detections, max_dist_m=umbral_m or None,
-                                         dist_factor=dist_factor)
-        st.metric("Parejas candidatas a revisar", len(ss.candidates))
-        st.caption("Parejas con la misma clase cuyo centro GPS está dentro del umbral.")
-        if ss.candidates:
-            st.dataframe(pd.DataFrame([
-                {"id": c["id"], "clase": ss.detections[c["a"]]["class"],
-                 "foto A": ss.detections[c["a"]]["img"],
-                 "foto B": ss.detections[c["b"]]["img"],
-                 "dist_m": c["dist_m"], "umbral_m": c["umbral_m"]}
-                for c in ss.candidates]))
+uploaded_files = st.sidebar.file_uploader(
+    "📤 Sube tus fotos de dron (JPEG)",
+    type=["jpg", "jpeg", "JPG", "JPEG"],
+    accept_multiple_files=True,
+)
 
-# ----------------------------- paso 4: validar -----------------------------
-elif step == "4. Validar uniones":
-    st.header("4. Validación visual de cada pareja")
-    pend = pending_candidates()
-    if not ss.candidates:
-        st.info("Primero genera candidatas (paso 3).")
-    elif not pend:
-        st.success(f"Todas las parejas validadas ({len(ss.decisions)} decisiones). "
-                   "Ve al paso 5.")
-        if st.button("Revisar de nuevo"):
-            ss.decisions = {}
-            st.rerun()
-    else:
-        c = pend[0]
-        da, db = ss.detections[c["a"]], ss.detections[c["b"]]
-        col1, col2, col3 = st.columns([2, 2, 1.2])
-        with col1:
-            st.subheader("Detección A")
-            st.image(crop_with_margin(ss.photos[da["img"]]["pil"], da["bbox"]),
-                     caption=f'{da["img"]} — {da["class"]} ({da["conf"]:.2f})')
-        with col2:
-            st.subheader("Detección B")
-            st.image(crop_with_margin(ss.photos[db["img"]]["pil"], db["bbox"]),
-                     caption=f'{db["img"]} — {db["class"]} ({db["conf"]:.2f})')
-        with col3:
-            st.metric("Pendientes", len(pend))
-            st.write(f"**Clase:** {da['class']}")
-            st.write(f"**Distancia GPS:** {c['dist_m']} m (umbral {c['umbral_m']} m)")
-            st.write(f"**Coord. A:** {da['lat']:.6f}, {da['lon']:.6f}")
-            st.write(f"**Coord. B:** {db['lat']:.6f}, {db['lon']:.6f}")
-            st.divider()
-            if st.button("✅ Misma ave (unir)", type="primary", use_container_width=True):
-                ss.decisions[c["id"]] = True
-                st.rerun()
-            if st.button("❌ Son aves distintas", use_container_width=True):
-                ss.decisions[c["id"]] = False
-                st.rerun()
-            if st.button("⏭ Omitir por ahora", use_container_width=True):
-                ss.candidates.append(ss.candidates.pop(ss.candidates.index(c)))
-                st.rerun()
+use_detector = st.sidebar.checkbox(
+    "Usar detector de aves (YOLOv8) para refinar frontera",
+    value=True,
+    help="Si está activado, la frontera se ajusta pasando entre aves duplicadas. "
+         "Si no, usa solo la línea media geométrica basada en GPS.",
+)
 
-# ----------------------------- paso 5: resultado ---------------------------
-else:
-    st.header("5. Conteo final de individuos")
-    if not ss.detections:
-        st.info("Pipeline vacío. Sube fotos y ejecuta los pasos anteriores.")
-    else:
-        grupos = cluster_detections(ss.detections, ss.candidates, ss.decisions)
-        individuos = []
-        for g in grupos:
-            best = max(g, key=lambda i: ss.detections[i]["conf"])
-            d = ss.detections[best]
-            individuos.append({"clase": d["class"], "lat": d["lat"], "lon": d["lon"],
-                               "conf": d["conf"], "foto": d["img"],
-                               "detecciones_unidas": len(g)})
-        df = pd.DataFrame(individuos)
-        c1, c2 = st.columns(2)
-        with c1:
-            st.subheader("Conteo por clase")
-            st.table(df["clase"].value_counts().reindex(CLASES, fill_value=0)
-                     .rename_axis("clase").rename("individuos"))
-        with c2:
-            st.subheader("Mapa de individuos")
-            st.map(df.rename(columns={"lat": "latitude", "lon": "longitude"}))
-        st.dataframe(df)
-        st.download_button("Descargar CSV", df.to_csv(index=False).encode(),
-                           "conteo_aves.csv", "text/csv")
-        st.caption(f"{len(ss.detections)} detecciones → {len(individuos)} individuos "
-                   f"únicos (factor de compresión "
-                   f"{len(ss.detections)/max(len(individuos),1):.2f}x).")
+conf_threshold = st.sidebar.slider(
+    "Umbral de confianza del detector", 0.05, 0.9, 0.25, 0.05,
+    help="Confianza mínima para considerar una detección de ave válida.",
+)
+
+max_match_distance = st.sidebar.slider(
+    "Distancia máxima para emparejar duplicados (m)", 0.5, 10.0, 3.0, 0.5,
+    help="Dos detecciones en fotos distintas se consideran la misma ave "
+         "si sus centros están a menos de esta distancia en metros.",
+)
+
+min_overlap_area = st.sidebar.slider(
+    "Área mínima de superposición (m²)", 0.0, 100.0, 1.0, 1.0,
+    help="Pares con intersección menor a este valor se ignoran.",
+)
+
+st.sidebar.markdown("---")
+st.sidebar.info(
+    "**Nota:** Esta app usa el modelo genérico `yolov8n.pt` de Ultralytics "
+    "(clase 'bird' de COCO) solo para calcular la frontera. "
+    "Tu modelo `pinguino_pelicano_piquero.pt` se usaría en un paso posterior, "
+    "sobre las fotos ya limpias."
+)
+
+# ---------------------------------------------------------------------------
+# Estado de sesión
+# ---------------------------------------------------------------------------
+if "pair_adjustments" not in st.session_state:
+    st.session_state.pair_adjustments = {}   # pair_idx -> {"offset": float, "angle": float}
+if "processed_ready" not in st.session_state:
+    st.session_state.processed_ready = False
+if "processed_images" not in st.session_state:
+    st.session_state.processed_images = {}
+
+# ---------------------------------------------------------------------------
+# Procesamiento principal (se ejecuta cuando hay archivos subidos)
+# ---------------------------------------------------------------------------
+if not uploaded_files:
+    st.title("🐦 Unión de Fotos de Aves Marinas")
+    st.markdown(
+        """
+        Bienvenido. Esta aplicación te permite:
+        1. **Subir un lote de fotos** tomadas con dron (con georreferencia EXIF/XMP).
+        2. **Detectar automáticamente** qué fotos se superponen.
+        3. **Dibujar una frontera** entre cada par superpuesto para evitar contar el mismo ave dos veces.
+        4. **Editar la frontera** manualmente si el algoritmo se equivoca.
+        5. **Descargar las fotos procesadas** con la zona superpuesta pintada de blanco.
+
+        👈 Comienza subiendo tus fotos en el panel de la izquierda.
+        """
+    )
+    st.stop()
+
+# Guardar archivos subidos a disco temporal
+with tempfile.TemporaryDirectory() as tmpdir:
+    file_paths = []
+    for uf in uploaded_files:
+        path = os.path.join(tmpdir, uf.name)
+        with open(path, "wb") as f:
+            f.write(uf.getvalue())
+        file_paths.append(path)
+
+    # --- Paso 1: Metadatos y footprints ---
+    with st.spinner("Leyendo metadatos EXIF/XMP..."):
+        metadata_list = cached_metadata(tuple(file_paths))
+
+    # Filtrar fotos sin GPS
+    valid_photos = [m for m in metadata_list if m.get('latitude') and m.get('longitude')]
+    if not valid_photos:
+        st.error("Ninguna de las fotos subidas contiene coordenadas GPS válidas. "
+                 "Asegúrate de que sean fotos de dron con metadatos intactos.")
+        st.stop()
+
+    with st.spinner("Calculando footprints..."):
+        photos = cached_footprints(tuple(valid_photos))
+
+    with st.spinner("Buscando pares superpuestos..."):
+        pairs = cached_pairs(tuple(photos), min_overlap_area)
+
+    st.title("🐦 Unión de Fotos de Aves Marinas")
+    st.success(f"Se encontraron {len(pairs)} par(es) superpuesto(s) de {len(photos)} foto(s).")
+
+    # --- Pestañas principales ---
+    tab_map, tab_pairs, tab_preview, tab_download = st.tabs(
+        ["🗺️ Mapa", "🔗 Pares", "✏️ Edición y Vista Previa", "⬇️ Descargar"]
+    )
+
+    # =====================================================================
+    # TAB 1: MAPA
+    # =====================================================================
+    with tab_map:
+        st.subheader("Footprints y superposiciones")
+        m = build_footprint_map(photos, pairs)
+        st.components.v1.html(m._repr_html_(), height=600)
+
+    # =====================================================================
+    # TAB 2: LISTA DE PARES
+    # =====================================================================
+    with tab_pairs:
+        st.subheader("Pares detectados")
+        if not pairs:
+            st.info("No se encontraron superposiciones con los criterios actuales.")
+        else:
+            for i, pair in enumerate(pairs):
+                a_name = os.path.basename(pair['photo_a']['path'])
+                b_name = os.path.basename(pair['photo_b']['path'])
+                area = pair['intersection_area_m2']
+                with st.expander(f"Par {i+1}: {a_name} ↔ {b_name} — {area:.1f} m²"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.image(pair['photo_a']['path'], caption=a_name, use_container_width=True)
+                    with col2:
+                        st.image(pair['photo_b']['path'], caption=b_name, use_container_width=True)
+
+    # =====================================================================
+    # TAB 3: EDICIÓN Y VISTA PREVIA
+    # =====================================================================
+    with tab_preview:
+        if not pairs:
+            st.info("No hay pares para editar.")
+        else:
+            st.subheader("Ajuste de fronteras")
+            st.markdown(
+                "Para cada par superpuesto puedes ajustar la línea de separación "
+                "usando los controles de **desplazamiento** (mover la línea) y "
+                "**rotación** (inclinar la línea)."
+            )
+
+            # Cargar modelo YOLO si se necesita
+            model = cached_yolo() if use_detector else None
+
+            pair_idx = st.selectbox("Selecciona un par para editar", range(len(pairs)),
+                                    format_func=lambda i: f"Par {i+1}: {os.path.basename(pairs[i]['photo_a']['path'])} ↔ {os.path.basename(pairs[i]['photo_b']['path'])}")
+
+            pair = pairs[pair_idx]
+            photo_a = pair['photo_a']
+            photo_b = pair['photo_b']
+
+            # Detecciones (si el modelo está activo)
+            dets_a, dets_b, matched = [], [], []
+            if use_detector and model is not None:
+                with st.spinner("Detectando aves en el par seleccionado..."):
+                    dets_a = detect_birds(photo_a['path'], model, conf_threshold)
+                    dets_b = detect_birds(photo_b['path'], model, conf_threshold)
+                    matched = match_duplicates(dets_a, dets_b, photo_a, photo_b, max_match_distance)
+                st.caption(f"Aves detectadas: {len(dets_a)} en A, {len(dets_b)} en B. Duplicados emparejados: {len(matched)}.")
+
+            # Calcular frontera base
+            boundary = compute_boundary(pair, matched, use_detector=use_detector)
+
+            # Sliders de ajuste
+            adj_key = f"pair_{pair_idx}"
+            if adj_key not in st.session_state.pair_adjustments:
+                st.session_state.pair_adjustments[adj_key] = {"offset": 0.0, "angle": 0.0}
+
+            col_ctrl1, col_ctrl2 = st.columns(2)
+            with col_ctrl1:
+                offset = st.slider(
+                    "Desplazamiento de frontera (px)",
+                    -200, 200,
+                    int(st.session_state.pair_adjustments[adj_key]["offset"]),
+                    1,
+                    key=f"offset_{pair_idx}"
+                )
+            with col_ctrl2:
+                angle = st.slider(
+                    "Rotación de frontera (°)",
+                    -45, 45,
+                    int(st.session_state.pair_adjustments[adj_key]["angle"]),
+                    1,
+                    key=f"angle_{pair_idx}"
+                )
+            st.session_state.pair_adjustments[adj_key] = {"offset": offset, "angle": angle}
+
+            # Aplicar ajuste a la línea en píxeles
+            def adjust_line(line_px, img_w, img_h, offset_px, angle_deg):
+                if not line_px or len(line_px) < 2:
+                    return line_px
+                x1, y1 = line_px[0]
+                x2, y2 = line_px[-1]
+                # Centro de la línea
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                # Vector dirección
+                dx = x2 - x1
+                dy = y2 - y1
+                L = math.hypot(dx, dy) + 1e-9
+                ux, uy = dx / L, dy / L
+                # Perpendicular
+                px, py = -uy, ux
+                # Aplicar offset perpendicular
+                cx += px * offset_px
+                cy += py * offset_px
+                # Aplicar rotación
+                theta = math.radians(angle_deg)
+                rx = ux * math.cos(theta) - uy * math.sin(theta)
+                ry = ux * math.sin(theta) + uy * math.cos(theta)
+                # Extender hasta los bordes de la imagen
+                # Usamos parametrización: (cx, cy) + t * (rx, ry)
+                # Encontrar t tal que x o y estén en [0, w] o [0, h]
+                ts = []
+                if abs(rx) > 1e-6:
+                    ts.append((0 - cx) / rx)
+                    ts.append((img_w - cx) / rx)
+                if abs(ry) > 1e-6:
+                    ts.append((0 - cy) / ry)
+                    ts.append((img_h - cy) / ry)
+                ts = [t for t in ts if not math.isinf(t)]
+                if len(ts) >= 2:
+                    t1, t2 = min(ts), max(ts)
+                    return [(cx + t1 * rx, cy + t1 * ry), (cx + t2 * rx, cy + t2 * ry)]
+                return line_px
+
+            img_w_a, img_h_a = photo_a['image_width'], photo_a['image_height']
+            img_w_b, img_h_b = photo_b['image_width'], photo_b['image_height']
+
+            line_a_adj = adjust_line(boundary['line_pixels_a'], img_w_a, img_h_a, offset, angle)
+            line_b_adj = adjust_line(boundary['line_pixels_b'], img_w_b, img_h_b, offset, angle)
+
+            # Vista previa con frontera dibujada
+            col_a, col_b = st.columns(2)
+            with col_a:
+                img_a = Image.open(photo_a['path']).convert('RGB')
+                draw_a = ImageDraw.Draw(img_a)
+                if line_a_adj and len(line_a_adj) == 2:
+                    draw_a.line(line_a_adj, fill=(255, 0, 0), width=5)
+                st.image(img_a, caption="Foto A con frontera (rojo)", use_container_width=True)
+
+            with col_b:
+                img_b = Image.open(photo_b['path']).convert('RGB')
+                draw_b = ImageDraw.Draw(img_b)
+                if line_b_adj and len(line_b_adj) == 2:
+                    draw_b.line(line_b_adj, fill=(255, 0, 0), width=5)
+                st.image(img_b, caption="Foto B con frontera (rojo)", use_container_width=True)
+
+            # Vista previa del resultado (máscara aplicada)
+            st.markdown("---")
+            st.subheader("Vista previa del resultado")
+
+            # Puntos de referencia para la máscara: centroide de la otra foto proyectado
+            cx_a, cy_a = photo_a['footprint']['centroid_utm']
+            cx_b, cy_b = photo_b['footprint']['centroid_utm']
+            H_a = boundary['homography_a']
+            H_b = boundary['homography_b']
+            ref_a = _utm_to_pixel(cx_b, cy_b, H_a, img_w_a, img_h_a)
+            ref_b = _utm_to_pixel(cx_a, cy_a, H_b, img_w_b, img_h_b)
+
+            mask_a = create_mask(img_w_a, img_h_a, line_a_adj, ref_a)
+            mask_b = create_mask(img_w_b, img_h_b, line_b_adj, ref_b)
+
+            img_a_preview = apply_white_mask(Image.open(photo_a['path']).convert('RGB'), mask_a)
+            img_b_preview = apply_white_mask(Image.open(photo_b['path']).convert('RGB'), mask_b)
+
+            col_pa, col_pb = st.columns(2)
+            with col_pa:
+                st.image(img_a_preview, caption="Foto A procesada (zona B en blanco)", use_container_width=True)
+            with col_pb:
+                st.image(img_b_preview, caption="Foto B procesada (zona A en blanco)", use_container_width=True)
+
+    # =====================================================================
+    # TAB 4: PROCESAMIENTO Y DESCARGA
+    # =====================================================================
+    with tab_download:
+        st.subheader("Procesar todo el lote y descargar")
+        st.markdown(
+            "Haz clic en **Procesar todas las fotos** para aplicar las fronteras "
+            "(con los ajustes manuales que hayas hecho) a TODO el lote y generar un ZIP."
+        )
+
+        if st.button("🚀 Procesar todas las fotos", type="primary"):
+            with st.spinner("Procesando... esto puede tomar unos minutos."):
+                model = cached_yolo() if use_detector else None
+
+                # Inicializar máscaras acumuladas por foto
+                masks = {}
+                images = {}
+                for p in photos:
+                    w = p.get('image_width', 1)
+                    h = p.get('image_height', 1)
+                    masks[p['path']] = np.zeros((h, w), dtype=bool)
+                    images[p['path']] = Image.open(p['path']).convert('RGB')
+
+                progress = st.progress(0.0)
+                for i, pair in enumerate(pairs):
+                    photo_a = pair['photo_a']
+                    photo_b = pair['photo_b']
+
+                    # Detecciones
+                    dets_a, dets_b, matched = [], [], []
+                    if use_detector and model is not None:
+                        dets_a = detect_birds(photo_a['path'], model, conf_threshold)
+                        dets_b = detect_birds(photo_b['path'], model, conf_threshold)
+                        matched = match_duplicates(dets_a, dets_b, photo_a, photo_b, max_match_distance)
+
+                    boundary = compute_boundary(pair, matched, use_detector=use_detector)
+
+                    # Aplicar ajustes manuales si existen
+                    adj_key = f"pair_{i}"
+                    offset_px = st.session_state.pair_adjustments.get(adj_key, {}).get("offset", 0)
+                    angle_deg = st.session_state.pair_adjustments.get(adj_key, {}).get("angle", 0)
+
+                    img_w_a, img_h_a = photo_a['image_width'], photo_a['image_height']
+                    img_w_b, img_h_b = photo_b['image_width'], photo_b['image_height']
+
+                    line_a = adjust_line(boundary['line_pixels_a'], img_w_a, img_h_a, offset_px, angle_deg)
+                    line_b = adjust_line(boundary['line_pixels_b'], img_w_b, img_h_b, offset_px, angle_deg)
+
+                    # Referencias
+                    cx_a, cy_a = photo_a['footprint']['centroid_utm']
+                    cx_b, cy_b = photo_b['footprint']['centroid_utm']
+                    H_a = boundary['homography_a']
+                    H_b = boundary['homography_b']
+                    ref_a = _utm_to_pixel(cx_b, cy_b, H_a, img_w_a, img_h_a)
+                    ref_b = _utm_to_pixel(cx_a, cy_a, H_b, img_w_b, img_h_b)
+
+                    mask_a = create_mask(img_w_a, img_h_a, line_a, ref_a)
+                    mask_b = create_mask(img_w_b, img_h_b, line_b, ref_b)
+
+                    # Acumular (OR)
+                    masks[photo_a['path']] = np.logical_or(masks[photo_a['path']], mask_a)
+                    masks[photo_b['path']] = np.logical_or(masks[photo_b['path']], mask_b)
+
+                    progress.progress((i + 1) / len(pairs))
+
+                # Aplicar máscaras finales
+                processed = {}
+                for p in photos:
+                    fname = os.path.basename(p['path'])
+                    img = apply_white_mask(images[p['path']], masks[p['path']])
+                    processed[fname] = img
+
+                zip_bytes = build_download_zip(processed)
+                st.session_state.processed_images = processed
+                st.session_state.processed_ready = True
+                st.success(f"¡Listo! {len(processed)} fotos procesadas.")
+
+        if st.session_state.processed_ready:
+            zip_bytes = build_download_zip(st.session_state.processed_images)
+            st.download_button(
+                label="⬇️ Descargar lote procesado (ZIP)",
+                data=zip_bytes,
+                file_name="fotos_aves_procesadas.zip",
+                mime="application/zip",
+            )
+
+            # Mostrar miniaturas de algunas fotos procesadas
+            with st.expander("Ver miniaturas del resultado"):
+                cols = st.columns(4)
+                for idx, (fname, img) in enumerate(st.session_state.processed_images.items()):
+                    with cols[idx % 4]:
+                        st.image(img, caption=fname, use_container_width=True)

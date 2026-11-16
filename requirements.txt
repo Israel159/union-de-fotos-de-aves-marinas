@@ -1,11 +1,9 @@
-streamlit>=1.32
-# PyTorch CPU (evita que pip instale las librerías CUDA de ~3 GB, que exceden
-# los límites de Streamlit Cloud). Ultralytics instala torch>=1.8; con este
-# índice se resuelve la versión CPU.
---extra-index-url https://download.pytorch.org/whl/cpu
-torch>=2.0
-torchvision>=0.15
-ultralytics>=8.0
-pandas>=2.0
-Pillow>=10.0
-numpy>=1.24
+streamlit>=1.28.0
+Pillow>=10.0.0
+numpy>=1.24.0
+shapely>=2.0.0
+pyproj>=3.6.0
+folium>=0.14.0
+streamlit-folium>=0.15.0
+ultralytics>=8.0.200
+opencv-python-headless>=4.8.0

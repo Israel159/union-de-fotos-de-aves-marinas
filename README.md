@@ -1,70 +1,70 @@
-# Conteo de aves con deduplicación georreferenciada
+# Union de Fotos de Aves Marinas
 
-App Streamlit para contar aves (pingüino, piquero, pelícano, zarcillo) en lotes de
-fotos de dron con superposición, sin contar dos veces al mismo individuo.
+Aplicación Streamlit para eliminar zonas superpuestas entre fotos de dron georreferenciadas, preparándolas para algoritmos de reconocimiento de imágenes (por ejemplo, conteo de aves marinas con YOLO).
 
-## Cómo funciona
+## Problema que resuelve
 
-1. **Subir fotos**: lee lat/lon (EXIF), altitud y yaw (XMP de DJI) de cada foto.
-2. **Detectar**: corre el detector YOLO foto a foto (cada ave se detecta donde mejor se ve).
-3. **Emparejar**: propone parejas candidatas a duplicado (misma clase + centros GPS cercanos).
-4. **Validar**: una persona ve los dos recortes de cada pareja y decide
-   ✅ misma ave / ❌ distintas / ⏭ omitir. (Reemplaza al antiguo proceso manual de
-   pintar de blanco: mismo efecto, sin editar imágenes y con registro de cada decisión.)
-5. **Resultado**: conteo por clase, mapa y CSV descargable. Las uniones son
-   transitivas: si A=B y B=C, las tres detecciones cuentan como un solo individuo.
+Cuando un dron fotografía un área con **overlap** (superposición entre fotos consecutivas), el mismo ave puede aparecer en dos o más imágenes. Si se corre un detector de objetos directamente, esa ave se cuenta **dos veces** (o más). Esta app:
 
-## Instalación local
+1. Lee la georreferencia (GPS + altitud + orientación del gimbal) del EXIF/XMP de cada foto.
+2. Calcula el **footprint** (área fotografiada en el suelo) de cada imagen.
+3. Detecta automáticamente qué pares de fotos se superponen.
+4. Dibuja una **frontera de separación** entre cada par:
+   - **Base**: línea media geométrica entre los centroides de las fotos (solo GPS).
+   - **Refinamiento**: si se activa, usa un detector genérico de aves (YOLOv8) para encontrar aves duplicadas en la zona de overlap y ajusta la frontera para pasar **entre** ellas, evitando cortar ningún ave por la mitad.
+5. Permite **editar manualmente** cada frontera (desplazamiento y rotación).
+6. Pinta de **blanco** la zona superpuesta que corresponde a la otra foto.
+7. Genera un **ZIP** con todas las fotos procesadas listas para el detector de especies.
+
+## Estructura del repositorio
+
+```
+union-de-fotos-de-aves-marinas/
+├── app.py                      # Interfaz Streamlit
+├── requirements.txt            # Dependencias Python
+├── packages.txt                # Dependencias del sistema (Streamlit Cloud)
+├── README.md                   # Este archivo
+├── .gitignore
+├── modules/
+│   ├── __init__.py
+│   ├── exif_reader.py          # Lectura EXIF/XMP (DJI)
+│   ├── footprint.py            # Cálculo de footprints georreferenciados
+│   ├── overlap.py              # Detección de pares superpuestos
+│   ├── detector.py             # Detección genérica de aves con YOLOv8
+│   ├── boundary.py             # Cálculo de frontera híbrida
+│   ├── processor.py            # Aplicación de máscaras y generación de ZIP
+│   └── utils.py                # Visualización (mapas, etc.)
+├── models/                     # (vacío; YOLO se descarga automáticamente)
+└── assets/                     # (vacío)
+```
+
+## Despliegue en Streamlit Cloud
+
+1. **Crea un repositorio en GitHub** con el contenido de esta carpeta.
+2. Ve a [share.streamlit.io](https://share.streamlit.io) y conecta tu repositorio.
+3. El archivo de entrada es `app.py`.
+4. La primera vez que se ejecute, descargará automáticamente el modelo `yolov8n.pt` (~6 MB).
+
+## Uso local
 
 ```bash
-python -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-cp /ruta/a/tu/pinguino_piquero_pelicano.pt .      # raíz del proyecto
 streamlit run app.py
 ```
 
-## Despliegue en Streamlit Community Cloud
+## Notas importantes
 
-1. Crea una cuenta en GitHub (gratis) y otra en https://share.streamlit.io
-   (entra con "Sign in with GitHub").
-2. Sube este proyecto a un repo de GitHub. Opción A (web): en github.com pulsa
-   "New repository", "Upload files" y arrastra TODO el contenido de esta carpeta
-   (app.py, requirements.txt, la carpeta modules/ completa y
-   `pinguino_piquero_pelicano.pt`). Opción B (terminal):
-   ```bash
-   git init && git add -A && git commit -m "app conteo aves"
-   git branch -M main
-   git remote add origin https://github.com/TU_USUARIO/TU_REPO.git
-   git push -u origin main
-   ```
-3. **Importante — el archivo de pesos**: GitHub rechaza archivos > 100 MB.
-   Si tu `.pt` es más grande, súbelo a Google Drive/Dropbox con enlace de
-   descarga directa y descomenta/configura `_W download_from_url` en
-   `modules/detector.py`.
-4. En https://share.streamlit.io pulsa **"New app"** → elige tu repo, rama
-   `main`, archivo principal `app.py` → **"Deploy"**.
-5. La primera compilación tarda varios minutos (instala PyTorch CPU ~600 MB).
-   Cuando termina te da una URL pública tipo `https://tu-app.streamlit.app`.
+- **Detector genérico vs. detector de especies**: esta app usa `yolov8n.pt` (clase `bird` del dataset COCO) **solo** para calcular la frontera entre fotos. Tu modelo `pinguino_pelicano_piquero.pt` (o similar) debe usarse en un paso posterior, sobre las fotos ya limpias.
+- **Si el detector falla**: la app nunca se queda sin frontera. Si no detecta aves o no hay duplicados, automáticamente usa la línea media geométrica basada en GPS.
+- **Edición manual**: en la pestaña "Edición y Vista Previa" puedes ajustar cada frontera con sliders de desplazamiento y rotación.
+- **Altitud**: la app intenta usar `RelativeAltitude` del XMP de DJI. Si no existe, usa `GPSAltitude` como fallback.
 
-### Límites del plan gratuito
+## Fotos compatibles
 
-- ~1 GB de RAM: torch + ultralytics caben, pero evita lotes de cientos de fotos
-  pesadas en una sola sesión; procesa por lotes.
-- La app "se duerme" tras inactividad y tarda ~1 min en despertar.
-- **Sin almacenamiento persistente**: las fotos subidas y las decisiones viven
-  solo en la sesión. Descarga el CSV del paso 5 antes de cerrar.
-- No se necesitan secrets ni variables de entorno.
+- JPEG con metadatos EXIF estándar (GPS, focal length).
+- XMP de DJI (Phantom, Mavic, etc.) para orientación del gimbal y altitud relativa.
+- Probado con DJI Phantom 3 Professional.
 
-## Calibración del Phantom 3 Pro
+## Licencia
 
-Tu EXIF reporta focal 12.29 mm real / 24 mm equivalente, de donde la app deriva
-un sensor de ~18.4 × 12.3 mm (modo "EXIF automático"). DJI, sin embargo, publica
-un lente de 20 mm equiv. y FOV 94° (diagonal), que corresponde a ~84° × 62°
-horiz./vert. y a una huella de ~1.80 × 1.20 × altitud. Los EXIF de DJI son
-nominales, así que:
-
-- Prueba ambos modos en la barra lateral ("EXIF automático" vs "FOV calibrado").
-- Verifica con una pasada sobre un objeto de tamaño conocido (un bote, un auto,
-  una persona) a altitud conocida y compara el tamaño en píxeles con el esperado.
-- La validación visual del paso 4 te protege de errores de huella: si el
-  emparejamiento GPS propone parejas incorrectas, recházalas con ❌.
+MIT
