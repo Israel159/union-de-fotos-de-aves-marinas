@@ -57,14 +57,19 @@ def cached_metadata(file_paths: tuple) -> list:
     return [read_metadata(fp) for fp in file_paths]
 
 
-@st.cache_data(show_spinner="Calculando footprints georreferenciados...")
 def cached_footprints(metadata_tuple: tuple) -> list:
-    """Calcula footprints a partir de metadatos."""
+    """Calcula footprints a partir de metadatos.
+    Nota: no usamos @st.cache_data porque el resultado contiene objetos
+    shapely.Polygon que no son hashables y provocan UnhashableParamError.
+    """
     return batch_footprints(list(metadata_tuple))
 
 
-@st.cache_data(show_spinner="Detectando pares superpuestos...")
 def cached_pairs(photos_tuple: tuple, min_overlap: float) -> list:
+    """Detecta pares superpuestos.
+    Nota: no usamos @st.cache_data porque la entrada contiene objetos
+    shapely.Polygon que no son hashables.
+    """
     return find_overlapping_pairs(list(photos_tuple), min_overlap_m2=min_overlap)
 
 
