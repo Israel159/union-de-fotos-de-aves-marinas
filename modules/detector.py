@@ -1,6 +1,6 @@
 """
 Detección genérica de aves con YOLOv8 y matching de duplicados entre fotos vecinas.
-El modelo usado es el estándar de Ultralytics (COCO) que detecta la clase 'bird'.
+Soporta tiling nativo de Ultralytics (tile=True) para imágenes de alta resolución.
 """
 import math
 import os
@@ -15,9 +15,6 @@ try:
 except ImportError:
     _HAS_ULTRALYTICS = False
     YOLO = None
-
-# Clase "bird" en el dataset COCO de YOLOv8
-BIRD_CLASS_ID = 14
 
 
 def load_yolo_model(model_name: str = "yolov8n.pt"):
@@ -51,9 +48,27 @@ def load_yolo_model(model_name: str = "yolov8n.pt"):
     return model
 
 
-def detect_birds(image_path: str, model, conf_threshold: float = 0.25) -> List[dict]:
+def detect_birds(image_path: str, model, conf_threshold: float = 0.25,
+                 tile_size: int = None, class_id: int = None) -> List[dict]:
     """
-    Corre el detector YOLO en una imagen y devuelve solo las detecciones de aves.
+    Corre el detector YOLO en una imagen y devuelve las detecciones.
+
+    Parámetros
+    ----------
+    image_path : str
+        Ruta de la imagen.
+    model : YOLO
+        Modelo cargado.
+    conf_threshold : float
+        Confianza mínima.
+    tile_size : int, opcional
+        Tamaño del tile para tiling nativo de Ultralytics.
+        Si es None, se usa inferencia directa sin tiling.
+        Ejemplo: 640, 1024, 1280.
+    class_id : int, opcional
+        ID de clase a filtrar. Si es None, se devuelven TODAS las clases.
+        Para modelo COCO genérico (bird): 14.
+        Para modelo custom entrenado con una sola clase (ave): 0.
 
     Retorna lista de dicts:
         {
@@ -66,7 +81,22 @@ def detect_birds(image_path: str, model, conf_threshold: float = 0.25) -> List[d
     if model is None:
         return []
 
-    results = model(image_path, verbose=False)
+    kwargs = {"conf": conf_threshold, "verbose": False}
+
+    # Tiling nativo de Ultralytics (reemplaza a SAHI)
+    if tile_size:
+        kwargs["imgsz"] = tile_size
+        try:
+            # Versiones recientes de ultralytics soportan tile=True nativo
+            kwargs["tile"] = True
+            results = model(image_path, **kwargs)
+        except TypeError:
+            # Fallback: versión anterior sin soporte de tile nativo
+            del kwargs["tile"]
+            results = model(image_path, **kwargs)
+    else:
+        results = model(image_path, **kwargs)
+
     detections = []
     for r in results:
         boxes = r.boxes
@@ -74,7 +104,8 @@ def detect_birds(image_path: str, model, conf_threshold: float = 0.25) -> List[d
             continue
         for box in boxes:
             cls_id = int(box.cls.item())
-            if cls_id != BIRD_CLASS_ID:
+            # Si class_id es None, aceptamos todas las clases
+            if class_id is not None and cls_id != class_id:
                 continue
             conf = float(box.conf.item())
             if conf < conf_threshold:

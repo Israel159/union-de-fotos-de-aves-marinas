@@ -99,9 +99,28 @@ use_detector = st.sidebar.checkbox(
          "Si no, usa solo la línea media geométrica basada en GPS.",
 )
 
+class_id = st.sidebar.number_input(
+    "ID de clase a detectar",
+    min_value=-1, max_value=999, value=14,
+    help="ID de la clase que representa 'ave' en tu modelo. "
+         "Modelo COCO genérico (bird): 14. "
+         "Modelo custom con una sola clase (ave): 0. "
+         "Usa -1 para detectar TODAS las clases.",
+)
+
 conf_threshold = st.sidebar.slider(
     "Umbral de confianza del detector", 0.05, 0.9, 0.25, 0.05,
-    help="Confianza mínima para considerar una detección de ave válida.",
+    help="Confianza mínima para considerar una detección válida.",
+)
+
+tile_size = st.sidebar.selectbox(
+    "Tamaño de tile (tiling nativo)",
+    options=[None, 320, 480, 640, 1024, 1280, 1536],
+    index=0,
+    format_func=lambda x: "Sin tiling (inferencia directa)" if x is None else f"{x} px",
+    help="Para fotos de alta resolución (dron), usar un tile más pequeño "
+         "permite detectar aves más pequeñas. Activa el tiling nativo de Ultralytics "
+         "(reemplaza a SAHI). Recomendado: 640 o 1024 para fotos 4K.",
 )
 
 max_match_distance = st.sidebar.slider(
@@ -117,9 +136,8 @@ min_overlap_area = st.sidebar.slider(
 
 st.sidebar.markdown("---")
 st.sidebar.info(
-    "**Nota:** Esta app usa el modelo genérico `yolov8n.pt` de Ultralytics "
-    "(clase 'bird' de COCO) solo para calcular la frontera. "
-    "Tu modelo `pinguino_pelicano_piquero.pt` se usaría en un paso posterior, "
+    "**Nota:** El detector usado aquí es solo para calcular la frontera entre fotos. "
+    "Tu modelo de especies (pinguino_pelicano_piquero.pt) se usaría en un paso posterior, "
     "sobre las fotos ya limpias."
 )
 
@@ -285,8 +303,11 @@ def adjust_line(line_px, img_w, img_h, offset_px, angle_deg):
             dets_a, dets_b, matched = [], [], []
             if use_detector and model is not None:
                 with st.spinner("Detectando aves en el par seleccionado..."):
-                    dets_a = detect_birds(photo_a['path'], model, conf_threshold)
-                    dets_b = detect_birds(photo_b['path'], model, conf_threshold)
+                    cls_filter = None if class_id < 0 else class_id
+                    dets_a = detect_birds(photo_a['path'], model, conf_threshold,
+                                          tile_size=tile_size, class_id=cls_filter)
+                    dets_b = detect_birds(photo_b['path'], model, conf_threshold,
+                                          tile_size=tile_size, class_id=cls_filter)
                     matched = match_duplicates(dets_a, dets_b, photo_a, photo_b, max_match_distance)
                 st.caption(f"Aves detectadas: {len(dets_a)} en A, {len(dets_b)} en B. Duplicados emparejados: {len(matched)}.")
 
@@ -394,8 +415,11 @@ def adjust_line(line_px, img_w, img_h, offset_px, angle_deg):
                     # Detecciones
                     dets_a, dets_b, matched = [], [], []
                     if use_detector and model is not None:
-                        dets_a = detect_birds(photo_a['path'], model, conf_threshold)
-                        dets_b = detect_birds(photo_b['path'], model, conf_threshold)
+                        cls_filter = None if class_id < 0 else class_id
+                        dets_a = detect_birds(photo_a['path'], model, conf_threshold,
+                                              tile_size=tile_size, class_id=cls_filter)
+                        dets_b = detect_birds(photo_b['path'], model, conf_threshold,
+                                              tile_size=tile_size, class_id=cls_filter)
                         matched = match_duplicates(dets_a, dets_b, photo_a, photo_b, max_match_distance)
 
                     boundary = compute_boundary(pair, matched, use_detector=use_detector)
