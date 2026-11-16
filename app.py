@@ -1,11 +1,17 @@
 """App de conteo de aves con deduplicación georreferenciada.
 
 Flujo:
-  1. SUBIR fotos (lee EXIF GPS + XMP de DJI)
+  1. SUBIR fotos (lee EXIF GPS + XMP de DJI; soporta JPG y TIFF)
   2. DETECTAR aves en cada foto (YOLO)
   3. EMPAREJAR detecciones candidatas a duplicado (misma clase + cercanía GPS)
   4. VALIDAR cada pareja visualmente (misma ave / diferentes)
   5. RESULTADO: individuos únicos, conteo por clase y mapa
+
+Cambios respecto a la versión anterior:
+- Acepta .tif/.tiff (y .png, para dar un mensaje claro si el compresor web
+  eliminó los metadatos).
+- Fotos con GPS pero sin altitud ya NO se omiten: se les aplica la
+  "Altitud por defecto (m)" de la barra lateral y se avisa en pantalla.
 """
 import io
 import math
@@ -59,6 +65,12 @@ with st.sidebar.expander("Ajustes del detector y GPS"):
                                     "distancia en el suelo se proponen para unir. "
                                     "Empieza con 0 (automático) y ajústalo tras ver resultados.")
     dist_factor = st.slider("Factor de umbral automático", 0.5, 3.0, 1.2)
+    alt_default = st.number_input(
+        "Altitud por defecto (m)", min_value=1.0, value=50.0, step=5.0,
+        help="Se aplica a las fotos que tienen GPS pero perdieron la altitud "
+             "(p. ej. las pasadas por un compresor web que borra el XMP). "
+             "Idealmente súbelo a la altitud de vuelo de tu dron (la relativa "
+             "sobre el terreno).")
 
     st.caption("Huella en el suelo (elige el modo):")
     modo_huella = st.radio("Modo de huella",
@@ -81,8 +93,9 @@ with st.sidebar.expander("Ajustes del detector y GPS"):
 # ----------------------------- paso 1: subir -------------------------------
 if step == "1. Subir fotos":
     st.header("1. Subir lote de fotos")
-    files = st.file_uploader("Fotos del dron (JPG con EXIF/GPS)",
-                             type=["jpg", "jpeg"], accept_multiple_files=True)
+    files = st.file_uploader("Fotos del dron (JPG/TIFF con EXIF/GPS)",
+                             type=["jpg", "jpeg", "tif", "tiff", "png"],
+                             accept_multiple_files=True)
     if files:
         for f in files:
             if f.name in ss.photos:
@@ -94,9 +107,17 @@ if step == "1. Subir fotos":
             try:
                 meta = extract_metadata(path)
             except ValueError as e:
-                st.warning(f"{f.name}: {e}. Se omite.")
+                st.warning(f"{f.name}: {e}")
                 continue
             pil = Image.open(io.BytesIO(raw))
+            if meta["alt_m"] is None:
+                meta["alt_m"] = float(alt_default)
+                meta["alt_default"] = True
+                st.info(f"{f.name}: sin altitud en los metadatos — se usa la "
+                        f"altitud por defecto ({alt_default:.0f} m). "
+                        "Si el dron volaba a otra altura, cámbiala en la barra lateral.")
+            else:
+                meta["alt_default"] = False
             if modo_huella.startswith("FOV"):
                 g_w = footprint_from_fov(meta["alt_m"], fov_h)
                 g_h = footprint_from_fov(meta["alt_m"], fov_v)
@@ -115,6 +136,12 @@ if step == "1. Subir fotos":
         st.success(f"{len(ss.photos)} fotos cargadas con GPS.")
         st.dataframe(pd.DataFrame([{**v["meta"], "foto": k}
                                    for k, v in ss.photos.items()]))
+        n_def = sum(1 for v in ss.photos.values() if v["meta"].get("alt_default"))
+        if n_def:
+            st.warning(f"{n_def} foto(s) usan la altitud por defecto. El tamaño de "
+                       "la huella (y por tanto las coordenadas de cada ave) será "
+                       "aproximado: corrige la altitud real de vuelo y vuelve a "
+                       "subir el lote para mayor precisión.")
         st.caption("Verifica que alt_m sea razonable (la relativa del XMP es la "
                    "mejor) y que yaw_deg exista. Si el EXIF de DJI es nominal, "
                    "prueba el modo de huella por FOV en la barra lateral.")
