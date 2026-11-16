@@ -44,6 +44,8 @@ def find_overlapping_pairs(photos: List[dict], min_overlap_m2: float = 1.0) -> L
         return []
 
     tree = STRtree(polys)
+    # Mapeo: identidad del objeto Polygon -> índice original en photos
+    poly_to_idx = {id(p): idx for p, idx in zip(polys, valid_indices)}
     pairs = []
     seen = set()
 
@@ -54,9 +56,9 @@ def find_overlapping_pairs(photos: List[dict], min_overlap_m2: float = 1.0) -> L
         # Fotos candidatas que intersectan el bounding box de poly_a
         candidates = tree.query(poly_a)
         for candidate_poly in candidates:
-            # Encontrar el índice original del candidato
-            idx_b = valid_indices[polys.index(candidate_poly)]
-            if idx_b <= idx_a:
+            # Recuperar índice original usando identidad del objeto (id())
+            idx_b = poly_to_idx.get(id(candidate_poly))
+            if idx_b is None or idx_b <= idx_a:
                 continue
 
             pair_key = (min(idx_a, idx_b), max(idx_a, idx_b))
