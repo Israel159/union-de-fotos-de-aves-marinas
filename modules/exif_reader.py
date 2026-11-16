@@ -121,8 +121,11 @@ def read_metadata(image_path: str) -> dict:
         'path': image_path,
         'latitude': None,
         'longitude': None,
-        'altitude': None,           # metros (preferimos relativa)
-        'altitude_abs': None,       # metros absolutos
+        'altitude': None,           # altitud seleccionada para el cálculo
+        'altitude_relative': None,  # XMP DJI RelativeAltitude, sin modificar
+        'altitude_abs': None,       # metros absolutos / sobre el nivel del mar
+        'altitude_source': None,    # relative, absolute_fallback o None
+        'altitude_warning': None,
         'focal_length': None,       # mm (real del sensor)
         'focal_length_35mm': None,  # mm equivalente
         'image_width': None,
@@ -170,7 +173,7 @@ def read_metadata(image_path: str) -> dict:
         if dji.get('GpsLongitude'):
             meta['longitude'] = float(dji['GpsLongitude'])
         if dji.get('RelativeAltitude'):
-            meta['altitude'] = float(dji['RelativeAltitude'])
+            meta['altitude_relative'] = float(dji['RelativeAltitude'])
         if dji.get('AbsoluteAltitude'):
             meta['altitude_abs'] = float(dji['AbsoluteAltitude'])
         if dji.get('GimbalYawDegree'):
@@ -182,9 +185,32 @@ def read_metadata(image_path: str) -> dict:
         if dji.get('FlightYawDegree'):
             meta['flight_yaw'] = float(dji['FlightYawDegree'])
 
-    # Fallback: si no hay altitud relativa, usar absoluta
-    if meta['altitude'] is None and meta['altitude_abs'] is not None:
-        meta['altitude'] = meta['altitude_abs']
+    # Seleccionar una altitud utilizable. RelativeAltitude puede ser cero o
+    # negativa si el dron está por debajo del punto de despegue; no debe
+    # convertirse silenciosamente en una altura fija de 50 m.
+    relative = meta['altitude_relative']
+    absolute = meta['altitude_abs']
+    if relative is not None and relative > 0:
+        meta['altitude'] = relative
+        meta['altitude_source'] = 'relative'
+    elif absolute is not None and absolute > 0:
+        meta['altitude'] = absolute
+        meta['altitude_source'] = 'absolute_fallback'
+        if relative is not None and relative <= 0:
+            meta['altitude_warning'] = (
+                f'RelativeAltitude={relative:.3f} m no es válida como altura '
+                f'sobre el suelo; se usa AbsoluteAltitude={absolute:.3f} m '
+                'como aproximación.'
+            )
+    elif relative is not None:
+        # Conservar el valor para diagnóstico; compute_footprint aplicará su
+        # fallback explícito si no existe ninguna altitud positiva.
+        meta['altitude'] = relative
+        meta['altitude_source'] = 'invalid'
+        meta['altitude_warning'] = (
+            'No hay una altitud positiva en EXIF/XMP; el footprint será '
+            'solamente una aproximación.'
+        )
 
     # Normalizar focal_length y focal_length_35mm (pueden venir como IFDRational)
     if meta['focal_length'] is not None:

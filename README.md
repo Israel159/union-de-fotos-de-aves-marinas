@@ -21,6 +21,7 @@ Cuando un dron fotografía un área con **overlap** (superposición entre fotos 
 ```
 union-de-fotos-de-aves-marinas/
 ├── app.py                      # Interfaz Streamlit
+├── debug.py                    # Diagnóstico de metadatos y superposiciones
 ├── requirements.txt            # Dependencias Python
 ├── packages.txt                # Dependencias del sistema (Streamlit Cloud)
 ├── README.md                   # Este archivo
@@ -57,7 +58,17 @@ streamlit run app.py
 - **Detector genérico vs. detector de especies**: esta app usa `yolov8n.pt` (clase `bird` del dataset COCO) **solo** para calcular la frontera entre fotos. Tu modelo `pinguino_pelicano_piquero.pt` (o similar) debe usarse en un paso posterior, sobre las fotos ya limpias.
 - **Si el detector falla**: la app nunca se queda sin frontera. Si no detecta aves o no hay duplicados, automáticamente usa la línea media geométrica basada en GPS.
 - **Edición manual**: en la pestaña "Edición y Vista Previa" puedes ajustar cada frontera con sliders de desplazamiento y rotación.
-- **Altitud**: la app intenta usar `RelativeAltitude` del XMP de DJI. Si no existe, usa `GPSAltitude` como fallback.
+- **Altitud**: la app usa `RelativeAltitude` cuando es positiva. Si falta o es negativa, utiliza `AbsoluteAltitude`/`GPSAltitude` como aproximación y lo indica en el modo debug. La altitud absoluta no equivale necesariamente a la altura sobre el suelo; si el terreno está muy por encima o por debajo del nivel del mar, el tamaño del footprint será aproximado.
+- **Cámara inclinada**: cuando el gimbal no está en nadir, las esquinas se proyectan mediante rayos sobre un plano de suelo horizontal. El GPS del dron deja de tratarse como centro de la foto. Esto no sustituye un modelo de terreno ni una orientación fotogramétrica completa, especialmente en acantilados o con mucha pendiente.
+- **Fallback GPS**: la casilla de la barra lateral controla si se buscan fotos cercanas cuando no existe ninguna intersección real. Un par marcado como fallback tiene 0 m² de intersección calculada y debe revisarse manualmente.
+
+## Diagnóstico de un lote
+
+```bash
+python debug.py /ruta/a/carpeta/con/fotos
+```
+
+El script genera `debug_report.json` y `debug_map.html` dentro de esa carpeta. El reporte incluye la versión de Shapely, altitudes original y utilizada, orientación, tipo de proyección, footprints y distinción entre intersecciones reales y pares de fallback. La detección de pares es compatible tanto con Shapely 1 (el índice devuelve geometrías) como con Shapely 2 (devuelve índices numéricos).
 
 ## Fotos compatibles
 

@@ -84,70 +84,104 @@ def compute_footprint(lat: float, lon: float, altitude: float,
     transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
     cx, cy = transformer.transform(lon, lat)
 
-    # --- Caso simplificado: nadir (pitch ≈ -90°, roll ≈ 0°) ---
-    # El footprint es aproximadamente un rectángulo centrado en (cx, cy)
-    # Las dimensiones en suelo se derivan por triángulos semejantes:
-    #   ground_size = altitude * sensor_size / focal_length
+    # Tamaño nadir nominal, también usado como referencia por el fallback GPS.
     ground_w = altitude * (sensor_w_mm / focal_length)
     ground_h = altitude * (sensor_h_mm / focal_length)
 
-    # Esquinas del rectángulo sin rotar, centradas en origen
+    yaw_rad = math.radians(gimbal_yaw if gimbal_yaw is not None else 0.0)
+    pitch_rad = math.radians(gimbal_pitch if gimbal_pitch is not None else -90.0)
+    roll_rad = math.radians(gimbal_roll if gimbal_roll is not None else 0.0)
+    off_nadir = abs(pitch_rad + math.pi / 2)
+
+    # Rectángulo de respaldo, centrado en el GPS del dron. El orden de las
+    # esquinas coincide con boundary.py: abajo-izquierda, abajo-derecha,
+    # arriba-derecha y arriba-izquierda de la imagen.
     hw, hh = ground_w / 2.0, ground_h / 2.0
     corners = np.array([
         [-hw, -hh],
-        [ hw, -hh],
-        [ hw,  hh],
-        [-hw,  hh],
+        [hw, -hh],
+        [hw, hh],
+        [-hw, hh],
     ])
-
-    # Aplicar yaw (rotación alrededor del eje Z)
-    yaw_rad = math.radians(gimbal_yaw if gimbal_yaw is not None else 0.0)
     rot = np.array([
         [math.cos(yaw_rad), -math.sin(yaw_rad)],
-        [math.sin(yaw_rad),  math.cos(yaw_rad)],
+        [math.sin(yaw_rad), math.cos(yaw_rad)],
     ])
-    corners_rot = (rot @ corners.T).T
+    corners_utm = (rot @ corners.T).T + np.array([cx, cy])
+    center_utm = (cx, cy)
+    projection_method = 'nadir_rectangular'
+    projection_warning = None
 
-    # Trasladar al centro UTM
-    corners_utm = corners_rot + np.array([cx, cy])
+    # Cámara inclinada: intersectar los rayos de las cuatro esquinas con un
+    # plano de suelo horizontal. Coordenadas locales ENU: x=Este, y=Norte,
+    # z=arriba. DJI yaw=0 apunta al Norte y pitch=-90 apunta a nadir.
+    if off_nadir > math.radians(0.5) or abs(roll_rad) > math.radians(0.5):
+        theta = pitch_rad + math.pi / 2  # 0=nadir; positivo hacia adelante
+        forward = np.array([math.sin(yaw_rad), math.cos(yaw_rad), 0.0])
+        right = np.array([math.cos(yaw_rad), -math.sin(yaw_rad), 0.0])
+        up = np.array([0.0, 0.0, 1.0])
+        down_image = -math.cos(theta) * forward - math.sin(theta) * up
+        optical = math.sin(theta) * forward - math.cos(theta) * up
 
-    # Pitch / roll no exactamente nadir: proyectar con homografía simplificada
-    # Si pitch está lejos de -90° o roll != 0, aplicamos una corrección de perspectiva
-    # aproximada escalando los lados frontales/traseros.
-    pitch_rad = math.radians(gimbal_pitch if gimbal_pitch is not None else -90.0)
-    roll_rad = math.radians(gimbal_roll if gimbal_roll is not None else 0.0)
+        # Roll alrededor del eje óptico.
+        right_roll = math.cos(roll_rad) * right + math.sin(roll_rad) * down_image
+        down_roll = -math.sin(roll_rad) * right + math.cos(roll_rad) * down_image
 
-    # Solo corregimos si hay inclinación significativa (> 5° de nadir o roll)
-    if abs(pitch_rad + math.pi / 2) > 0.087 or abs(roll_rad) > 0.087:
-        # Ángulo de inclinación respecto a nadir
-        theta_p = -(pitch_rad + math.pi / 2)  # 0 cuando es nadir
-        theta_r = roll_rad
+        half_u = sensor_w_mm / (2.0 * focal_length)
+        half_v = sensor_h_mm / (2.0 * focal_length)
+        image_corners = [
+            (-half_u, half_v),   # abajo-izquierda
+            (half_u, half_v),    # abajo-derecha
+            (half_u, -half_v),   # arriba-derecha
+            (-half_u, -half_v),  # arriba-izquierda
+        ]
 
-        # Factor de escala por inclinación (aproximación de perspectiva)
-        # Para vuelos de dron estándar de aves, la inclinación suele ser pequeña
-        # así que esta aproximación lineal es suficiente.
-        fx = 1 / max(math.cos(theta_p), 0.1)
-        fy = 1 / max(math.cos(theta_r), 0.1)
+        projected = []
+        all_rays_hit_ground = True
+        for u, v in image_corners:
+            ray = u * right_roll + v * down_roll + optical
+            if ray[2] >= -1e-8:
+                all_rays_hit_ground = False
+                break
+            distance = -altitude / ray[2]
+            east_north = np.array([cx, cy]) + distance * ray[:2]
+            projected.append(east_north)
 
-        # Recomputar con escalas
-        corners_p = np.array([
-            [-hw * fx, -hh * fy],
-            [ hw * fx, -hh * fy],
-            [ hw * fx,  hh * fy],
-            [-hw * fx,  hh * fy],
-        ])
-        corners_rot = (rot @ corners_p.T).T
-        corners_utm = corners_rot + np.array([cx, cy])
+        if all_rays_hit_ground:
+            candidate = Polygon(projected)
+            if candidate.is_valid and candidate.area > 0:
+                corners_utm = np.asarray(projected)
+                center_distance = -altitude / optical[2]
+                center_xy = np.array([cx, cy]) + center_distance * optical[:2]
+                center_utm = (float(center_xy[0]), float(center_xy[1]))
+                projection_method = 'oblique_ray_plane'
+            else:
+                projection_warning = (
+                    'La proyección oblicua produjo un polígono inválido; '
+                    'se usa el rectángulo nadir de respaldo.'
+                )
+        else:
+            projection_warning = (
+                'Al menos una esquina apunta al horizonte o por encima de él; '
+                'no se puede intersectar con el suelo y se usa el rectángulo '
+                'nadir de respaldo.'
+            )
 
     poly = Polygon(corners_utm)
     return {
         'polygon': poly,
-        'centroid_utm': (cx, cy),
+        'centroid_utm': center_utm,
+        'drone_utm': (cx, cy),
         'epsg': epsg,
         'area_m2': poly.area,
         'width_m': ground_w,
         'height_m': ground_h,
         'corners': corners_utm.tolist(),
+        'altitude_used_m': altitude,
+        'off_nadir_deg': math.degrees(off_nadir),
+        'projection_method': projection_method,
+        'projection_warning': projection_warning,
+        'terrain_model': 'flat_ground_approximation',
     }
 
 
@@ -170,6 +204,11 @@ def batch_footprints(metadata_list: list) -> list:
             gimbal_yaw=meta.get('gimbal_yaw'),
             gimbal_pitch=meta.get('gimbal_pitch'),
             gimbal_roll=meta.get('gimbal_roll'),
+        )
+        fp['altitude_source'] = (
+            meta.get('altitude_source')
+            if meta.get('altitude') is not None and meta.get('altitude') > 0
+            else 'default_50m'
         )
         meta_copy = dict(meta)
         meta_copy['footprint'] = fp

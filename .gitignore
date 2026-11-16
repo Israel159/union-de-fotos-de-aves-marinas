@@ -27,9 +27,11 @@ ENV/
 # Streamlit
 .streamlit/secrets.toml
 
-# Modelos descargados
+# Modelos descargados (los propios dentro de models/ sí pueden versionarse)
 *.pt
 *.onnx
+!models/*.pt
+!models/*.onnx
 
 # Fotos de prueba
 *.jpg
